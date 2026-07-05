@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# Outputs
+scripts/output/
+*.png
+*.npz
+*.csv
+*.pkl
+*.jld2
+
+# Editor
+.vscode/
+.idea/
+*.egg-info/
+
+*/output/
