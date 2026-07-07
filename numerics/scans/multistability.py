@@ -20,7 +20,7 @@ from numerics.core.backend import get_array_module, get_backend, to_numpy
 from numerics.core.r_matrix import R_matrix_to_vector
 from numerics.models.base import Model
 from numerics.scans.parallel import TileScanRunner, make_tiles
-from numerics.scans.traversal import spiral_order
+from numerics.scans.traversal import ringwise_order, spiral_order
 from numerics.solvers.batched import solve_steady_state_batched
 from numerics.solvers.multi_search import find_steady_states
 from numerics.solvers.guess_bounds import (
@@ -36,6 +36,7 @@ from numerics.solvers.seeds import (
 from numerics.utils.fixed_points import (
     FixedPoint,
     deduplicate_fixed_points,
+    get_nearby_solutions,
     get_neighbor_solutions,
     match_to_neighbors,
     result_to_fixedpoint,
@@ -173,6 +174,17 @@ class MultistabilityScan2D:
         ``"cupy"`` forces the backend.
     parallel : ParallelConfig | None
         If given, use tile-based process parallelism.
+    gpu_ring_batch : bool
+        If True, use a ring-by-ring batched GPU solver instead of the CPU
+        point-by-point scan.  Requires ``backend="cupy"`` or ``"auto"`` with
+        CuPy installed.
+    max_batch_guesses : int | None
+        Maximum number of (point, guess) pairs to feed the GPU batched solver
+        at once.  ``None`` means no chunking.  Default 500000 is conservative
+        for 2-mode problems on a 4 GB GPU.
+    first_ring_guess_factor : float
+        Multiply ``n_random_guesses`` for the first ring(s) to mitigate the
+        lack of neighbor warm-start at the spiral center.
     verbose : bool
         Print progress messages.
     """
@@ -189,6 +201,9 @@ class MultistabilityScan2D:
         parallel: ParallelConfig | None = None,
         symmetry_axis: str | None = None,
         guess_bounds: GuessBounds | Literal["auto"] | None = None,
+        gpu_ring_batch: bool = False,
+        max_batch_guesses: int | None = 500000,
+        first_ring_guess_factor: float = 2.0,
         verbose: bool = True,
     ) -> None:
         if len(axes) != 2:
@@ -208,6 +223,9 @@ class MultistabilityScan2D:
         self.symmetry_axis = symmetry_axis
         self._guess_bounds_input = guess_bounds
         self.guess_bounds = self._resolve_guess_bounds(guess_bounds)
+        self.gpu_ring_batch = gpu_ring_batch
+        self.max_batch_guesses = max_batch_guesses
+        self.first_ring_guess_factor = first_ring_guess_factor
         self.verbose = verbose
 
         self.axis_names = list(self.axes.keys())
@@ -258,7 +276,14 @@ class MultistabilityScan2D:
         set_backend(self.backend)
         try:
             seed_Rs = self._discover_seeds()
-            if self.parallel is not None:
+            if self.gpu_ring_batch:
+                if self.backend != "cupy":
+                    raise RuntimeError(
+                        "gpu_ring_batch requires the cupy backend "
+                        '(set backend="cupy" or backend="auto" with CuPy installed)'
+                    )
+                arrays = self._run_gpu_ring(seed_Rs)
+            elif self.parallel is not None:
                 arrays = self._run_parallel(seed_Rs)
             else:
                 arrays = self._run_sequential(seed_Rs)
@@ -444,6 +469,146 @@ class MultistabilityScan2D:
         if self.verbose:
             elapsed = time.perf_counter() - t0
             print(f"  Parallel tile scan phase took {elapsed:.1f}s\n")
+        return n_solutions, R_matrices, residuals, branch_ids
+
+    # -------------------------------------------------------------------------
+    # GPU ring-batch scan
+    # -------------------------------------------------------------------------
+
+    def _run_gpu_ring(
+        self,
+        seed_Rs: list[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Ring-by-ring batched GPU scan.
+
+        The grid is traversed in Chebyshev-ring order.  All points on a given
+        ring are independent once all inner rings are solved, so they are fed
+        to ``solve_steady_state_batched`` as one GPU batch.  The CPU builds the
+        parameter/guess matrices, deduplicates results and writes them back in
+        the correct grid locations.
+
+        A second batched pass over each non-trivial ring uses the freshly
+        computed same-ring neighbors as additional warm starts.  This recovers
+        branches that the first pass missed because the ring was processed all
+        at once rather than in a local spiral order.
+        """
+        n_rows, n_cols = self.n_rows, self.n_cols
+        n_solutions, R_matrices, residuals, branch_ids = self._allocate_arrays(
+            (n_rows, n_cols)
+        )
+        grid: list[list[list[FixedPoint] | None]] = [
+            [None for _ in range(n_cols)] for _ in range(n_rows)
+        ]
+
+        rings = ringwise_order(n_rows, n_cols)
+        n_total_points = sum(len(ring) for ring in rings)
+        progress = ProgressTracker(
+            n_total_points, label="GPU ring scan", interval=2.0, enabled=self.verbose
+        )
+
+        for ring_idx, ring in enumerate(rings):
+            # The first ring has no inward neighbors, so boost random guesses.
+            n_random = self.n_random_guesses
+            if ring_idx == 0:
+                n_random = int(n_random * self.first_ring_guess_factor)
+
+            params_list = [self._params_at(i, j) for i, j in ring]
+            seed_lists: list[list[np.ndarray]] = []
+            for i, j in ring:
+                # Use a broader neighborhood so diagonal ring points also get
+                # seeds from the already-solved inner region.
+                nearby_fps = get_nearby_solutions(grid, i, j, radius=1)
+                seeds = [fp.R for fp in nearby_fps]
+                # Append global seed fixed points if not already present.
+                for R in seed_Rs:
+                    if not any(
+                        np.linalg.norm(R.flatten() - s.flatten()) < 1e-6
+                        for s in seeds
+                    ):
+                        seeds.append(R)
+                seed_lists.append(seeds)
+
+            point_roots = self._batched_search_at_points(
+                params_list,
+                seed_lists,
+                n_random=n_random,
+                scale=100.0,
+                seed=ring_idx,
+                line_search=False,
+            )
+
+            for (i, j), fps in zip(ring, point_roots):
+                neighbor_fps = get_neighbor_solutions(grid, i, j)
+                if fps:
+                    grid[i][j] = fps
+                    self._store_point(
+                        n_solutions,
+                        R_matrices,
+                        residuals,
+                        branch_ids,
+                        grid,
+                        i,
+                        j,
+                        fps,
+                        neighbor_fps,
+                    )
+                progress.update(failed=0 if fps else 1)
+
+            # Second pass: use same-ring neighbors now that the ring is solved.
+            if ring_idx > 0:
+                seed_lists2: list[list[np.ndarray]] = []
+                for i, j in ring:
+                    nearby_fps = get_nearby_solutions(grid, i, j, radius=1)
+                    seeds2 = [fp.R for fp in nearby_fps]
+                    for R in seed_Rs:
+                        if not any(
+                            np.linalg.norm(R.flatten() - s.flatten()) < 1e-6
+                            for s in seeds2
+                        ):
+                            seeds2.append(R)
+                    seed_lists2.append(seeds2)
+
+                extra_roots = self._batched_search_at_points(
+                    params_list,
+                    seed_lists2,
+                    n_random=self.n_random_guesses,
+                    scale=100.0,
+                    seed=ring_idx + 100000,
+                    line_search=False,
+                )
+
+                for (i, j), extra in zip(ring, extra_roots):
+                    current = grid[i][j] or []
+                    if not extra:
+                        continue
+                    merged = deduplicate_fixed_points(
+                        list(current) + list(extra),
+                        distance_tol=self.tolerances.distance_tol,
+                    )
+                    # Keep best residuals first; _store_point truncates to max_branches.
+                    merged.sort(key=lambda fp: fp.residual)
+                    if len(merged) != len(current):
+                        # Reset this point's slots before rewriting.
+                        for k in range(self.max_branches):
+                            R_matrices[i, j, k] = np.nan + 0j * np.nan
+                            residuals[i, j, k] = np.nan
+                            branch_ids[i, j, k] = -1
+                        neighbor_fps = get_neighbor_solutions(grid, i, j)
+                        self._store_point(
+                            n_solutions,
+                            R_matrices,
+                            residuals,
+                            branch_ids,
+                            grid,
+                            i,
+                            j,
+                            merged,
+                            neighbor_fps,
+                        )
+                        grid[i][j] = merged
+
+        progress.finish()
         return n_solutions, R_matrices, residuals, branch_ids
 
     # -------------------------------------------------------------------------
@@ -660,6 +825,8 @@ class MultistabilityScan2D:
         n_random: int,
         scale: float = 100.0,
         seed: int = 0,
+        max_batch_guesses: int | None = None,
+        line_search: bool = True,
     ) -> list[list[FixedPoint]]:
         """
         Run one batched Newton solve for many parameter points at once.
@@ -667,6 +834,10 @@ class MultistabilityScan2D:
         ``seed_guess_lists[i]`` supplies warm-start R matrices for
         ``params_list[i]``; random guesses are appended to reach a common
         batch width.
+
+        If ``max_batch_guesses`` is set, the batch is split into smaller chunks
+        so that ``B * max_g`` never exceeds it.  This prevents GPU out-of-memory
+        errors on large rings or 3-mode models.
         """
         from numerics.core.backend import set_backend
 
@@ -675,6 +846,7 @@ class MultistabilityScan2D:
 
         n = self.model.dim
         rng = np.random.default_rng(seed)
+        max_batch_guesses = max_batch_guesses or self.max_batch_guesses
 
         # Determine the number of guesses per point and pad.
         max_g = 0
@@ -695,6 +867,25 @@ class MultistabilityScan2D:
             max_g = max(max_g, len(guesses))
 
         B = len(params_list)
+
+        # Chunk large batches to respect GPU memory limits.
+        if max_batch_guesses is not None and B * max_g > max_batch_guesses:
+            chunk_size = max(1, max_batch_guesses // max_g)
+            point_roots: list[list[FixedPoint]] = []
+            for start in range(0, B, chunk_size):
+                end = start + chunk_size
+                point_roots.extend(
+                    self._batched_search_at_points(
+                        params_list[start:end],
+                        seed_guess_lists[start:end],
+                        n_random=n_random,
+                        scale=scale,
+                        seed=seed + start,
+                        max_batch_guesses=None,
+                    )
+                )
+            return point_roots
+
         guesses_arr = np.empty((B, max_g, n, n), dtype=complex)
         for b, guesses in enumerate(padded_guesses):
             for g, R in enumerate(guesses):
@@ -716,13 +907,13 @@ class MultistabilityScan2D:
                 guesses_arr,
                 max_iter=50,
                 tol=self.tolerances.solver_tol,
-                line_search=True,
+                line_search=line_search,
                 compute_eigvals=False,
             )
         finally:
             set_backend(original_backend)
 
-        point_roots: list[list[FixedPoint]] = []
+        point_roots = []
         for b, row in enumerate(results):
             candidates: list[FixedPoint] = []
             for res in row:

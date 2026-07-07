@@ -8,6 +8,7 @@ library so it can be reused for other models.
 
 from __future__ import annotations
 
+import argparse
 import time
 import sys
 from pathlib import Path
@@ -25,6 +26,16 @@ from numerics.scans.multistability import (
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="High-resolution multistability scan of the 2-mode VdP oscillator."
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use the CuPy ring-batch GPU solver (requires CuPy + NVIDIA GPU).",
+    )
+    args = parser.parse_args()
+
     model = VdP2Mode()
     base_params = {
         "omega_a": 0.0,
@@ -59,9 +70,10 @@ def main():
             branch_match_tol=10.0,
         ),
         max_branches=5,
-        backend="numpy",
-        parallel=ParallelConfig(n_workers=32, n_tiles=288),
+        backend="cupy" if args.gpu else "numpy",
+        parallel=None if args.gpu else ParallelConfig(n_workers=32, n_tiles=288),
         guess_bounds="auto",
+        gpu_ring_batch=args.gpu,
         verbose=True,
     )
 

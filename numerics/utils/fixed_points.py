@@ -80,6 +80,30 @@ def get_neighbor_solutions(
     return neighbors
 
 
+def get_nearby_solutions(
+    grid: list[list[list[FixedPoint] | None]],
+    i: int,
+    j: int,
+    radius: int = 1,
+) -> list[FixedPoint]:
+    """
+    Collect converged solutions from all grid points within a Chebyshev
+    neighborhood of the given radius.  This is useful for GPU batched scans
+    where the strict four-neighbor window is too small to provide warm-start
+    seeds (e.g. diagonal points on the same spiral ring).
+    """
+    nearby: list[FixedPoint] = []
+    ni, nj = len(grid), len(grid[0]) if grid else 0
+    for di in range(-radius, radius + 1):
+        for dj in range(-radius, radius + 1):
+            if di == 0 and dj == 0:
+                continue
+            ii, jj = i + di, j + dj
+            if 0 <= ii < ni and 0 <= jj < nj and grid[ii][jj] is not None:
+                nearby.extend(grid[ii][jj])
+    return nearby
+
+
 def match_to_neighbors(
     current: Sequence[FixedPoint],
     neighbors: Sequence[FixedPoint],

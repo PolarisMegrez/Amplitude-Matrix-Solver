@@ -34,3 +34,29 @@ def spiral_order(n_rows: int, n_cols: int, center_i: int | None = None, center_j
             for i in range(max(0, top + 1), min(n_rows, bottom)):
                 order.append((i, right))
     return order
+
+
+def ringwise_order(
+    n_rows: int,
+    n_cols: int,
+    center_i: int | None = None,
+    center_j: int | None = None,
+) -> list[list[tuple[int, int]]]:
+    """
+    Return the spiral order grouped by Chebyshev ring.
+
+    Each inner list contains all grid indices at the same ring radius.  Rings
+    are ordered from the center outward, which is the dependency order needed
+    for continuation-style warm starts.
+    """
+    if center_i is None:
+        center_i = n_rows // 2
+    if center_j is None:
+        center_j = n_cols // 2
+
+    order = spiral_order(n_rows, n_cols, center_i, center_j)
+    rings: dict[int, list[tuple[int, int]]] = {}
+    for i, j in order:
+        r = max(abs(i - center_i), abs(j - center_j))
+        rings.setdefault(r, []).append((i, j))
+    return [rings[k] for k in sorted(rings)]

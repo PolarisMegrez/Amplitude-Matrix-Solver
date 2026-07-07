@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
 import threading
 import time
+from functools import partial
 from typing import Callable, Sequence
 
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def make_tiles(
@@ -52,19 +53,32 @@ def make_tiles(
     return tiles
 
 
+def _worker_with_tile(
+    tile: tuple[int, int, int, int, int, int],
+    worker_func: Callable,
+) -> tuple[tuple[int, int, int, int, int, int], any]:
+    """Top-level wrapper so the tile identity travels with the result."""
+    return tile, worker_func(tile)
+
+
 class TileScanRunner:
     """
     Run a scan function independently over a set of rectangular tiles using a
     process pool.
 
+    ``multiprocessing.Pool`` is used instead of ``ProcessPoolExecutor`` because
+    the latter has a hard 61-worker ceiling on Windows (the queue-management
+    thread waits on at most 64 handles via ``WaitForMultipleObjects``).
+    ``multiprocessing.Pool`` polls results and is not subject to that limit.
+
     Parameters
     ----------
     worker_func : callable
-        Function called in each worker as ``worker_func(tile_args)``.
+        Function called in each worker as ``worker_func(tile)``.
     n_workers : int
         Number of worker processes.
     initializer : callable, optional
-        ``ProcessPoolExecutor`` initializer; typically sets per-worker globals.
+        ``multiprocessing.Pool`` initializer; typically sets per-worker globals.
     initargs : tuple
         Arguments passed to ``initializer``.
     verbose : bool
@@ -103,10 +117,23 @@ class TileScanRunner:
         if n_total == 0:
             return
 
+        # Never spawn more processes than tiles; also warn when going past the
+        # old ProcessPoolExecutor Windows limit, because each worker is a full
+        # process and memory can become the real bottleneck.
+        n_workers = min(self.n_workers, n_total)
+        if self.verbose and self.n_workers > 61:
+            print(
+                f"  Warning: requested {self.n_workers} workers exceeds the old "
+                f"ProcessPoolExecutor limit (61).  Using {n_workers} processes; "
+                f"ensure the machine has enough RAM for {n_workers} Python "
+                f"imports of the model stack.",
+                flush=True,
+            )
+
         t0 = time.perf_counter()
         if self.verbose:
             print(
-                f"  Dispatching {n_total} tiles to {self.n_workers} workers "
+                f"  Dispatching {n_total} tiles to {n_workers} workers "
                 f"(elapsed timer started)...",
                 flush=True,
             )
@@ -144,18 +171,19 @@ class TileScanRunner:
         status_thread.start()
 
         try:
-            with ProcessPoolExecutor(
-                max_workers=self.n_workers,
+            # ``partial`` keeps the worker function picklable on Windows while
+            # also carrying the tile identity through to the result.
+            worker = partial(_worker_with_tile, worker_func=self.worker_func)
+            chunksize = max(1, n_total // (n_workers * 4))
+
+            with mp.Pool(
+                processes=n_workers,
                 initializer=self.initializer,
                 initargs=self.initargs,
-            ) as executor:
-                futures = {
-                    executor.submit(self.worker_func, args): tile
-                    for tile, args in zip(tiles, tile_args)
-                }
-                for fut in as_completed(futures):
-                    tile = futures[fut]
-                    result = fut.result()
+            ) as pool:
+                for tile, result in pool.imap_unordered(
+                    worker, tiles, chunksize=chunksize
+                ):
                     with completed_lock:
                         completed += 1
                         c = completed
