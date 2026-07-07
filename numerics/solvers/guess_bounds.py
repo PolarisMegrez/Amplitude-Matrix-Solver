@@ -1,23 +1,27 @@
 """
 Adaptive initial-guess bounds for R-matrix steady-state solvers.
 
-The idea is to exploit the *diagonal balance* of the Liouvillian:
+Two complementary strategies are provided:
 
-    L_ii(R) = -i H_ii(R) R_ii + i R_ii H_ii^dagger(R) + D_ii(R)
-            = 2 R_ii Im H_ii(R) + D_ii(R)
+1. **Diagonal-balance inference** (cheap, analytic-ish):
+   solve the scalar equations ``L_ii(diag(r)) = 0`` to get typical diagonal
+   scales.  This works for any model but can underestimate the range when
+   off-diagonal coupling or bifurcations push solutions far from the diagonal
+   subspace.
 
-For a diagonal R this is a small system of real equations that depends only on
-model parameters and the diagonal entries.  Solving it gives characteristic
-scales (and signs) of the steady-state diagonal elements.  Those scales are
-used to build a much better random-guess distribution than a fixed ``scale``.
+2. **Exploration-based inference** (more expensive but robust):
+   run a short multi-start solve with heavy-tailed log-uniform guesses, then
+   measure the actual range of the converged solutions.  Because it uses the
+   full model, it naturally captures coupling effects and bifurcation
+   branches that the diagonal balance misses.
 
-This is model-agnostic: it only calls ``model.H`` and ``model.D`` and works for
-any R-matrix model (Kerr, van der Pol, Hopf, ...).
+By default ``infer_guess_bounds`` uses exploration and falls back to the
+ diagonal balance if the cheap solve does not find anything.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
@@ -36,8 +40,8 @@ class GuessBounds:
     offdiag_scale : np.ndarray
         Symmetric matrix of typical scales for the upper-triangle entries.
     diag_candidates : np.ndarray | None
-        Representative diagonal vectors obtained from the diagonal balance.
-        These are used to build a deterministic seed grid.
+        Representative diagonal vectors (e.g. from roots or from converged
+        solutions) used to build a deterministic seed grid.
     """
 
     diag_lower: np.ndarray
@@ -60,20 +64,56 @@ class GuessBounds:
         self,
         n_samples: int,
         seed: int | None = None,
+        tail_fraction: float = 0.25,
+        tail_orders: float = 3.0,
     ) -> list[np.ndarray]:
-        """Generate ``n_samples`` random Hermitian guesses inside the bounds."""
+        """
+        Generate ``n_samples`` random Hermitian guesses.
+
+        The distribution is a mixture:
+
+        * ``1 - tail_fraction`` of the guesses are sampled uniformly inside the
+          inferred bounds (exploitation around the typical scale).
+        * ``tail_fraction`` are sampled from a signed log-uniform tail spanning
+          ``tail_orders`` of magnitude beyond the bounds.  This catches
+          bifurcation branches whose R elements are much larger than the
+          diagonal-balance estimate.
+        """
         rng = np.random.default_rng(seed)
         n = self.dim
         guesses: list[np.ndarray] = []
+
+        # Typical scales used for the heavy tail.
+        typical = np.maximum(np.abs(self.diag_lower), np.abs(self.diag_upper))
+        typical = np.where(typical > 0.0, typical, 1.0)
+
         for _ in range(n_samples):
             R = np.zeros((n, n), dtype=complex)
-            # Diagonal entries: uniform over the inferred signed range
+            use_tail = rng.random() < tail_fraction
+
             for i in range(n):
-                R[i, i] = rng.uniform(self.diag_lower[i], self.diag_upper[i])
-            # Off-diagonal entries: normal with per-pair scale
+                if use_tail:
+                    # Signed log-uniform: several orders of magnitude around the
+                    # inferred typical scale.
+                    log_mag = rng.uniform(
+                        np.log10(typical[i]) - tail_orders,
+                        np.log10(typical[i]) + tail_orders,
+                    )
+                    mag = 10.0**log_mag
+                    sign = rng.choice([-1.0, 1.0])
+                    R[i, i] = sign * mag
+                else:
+                    R[i, i] = rng.uniform(self.diag_lower[i], self.diag_upper[i])
+
             for i in range(n):
                 for j in range(i + 1, n):
                     s = self.offdiag_scale[i, j]
+                    if use_tail:
+                        s_tail = max(s, 10.0 ** (rng.uniform(
+                            np.log10(max(s, 1e-8)) - tail_orders,
+                            np.log10(max(s, 1e-8)) + tail_orders,
+                        )))
+                        s = s_tail
                     re = rng.normal(0.0, s)
                     im = rng.normal(0.0, s)
                     R[i, j] = re + 1j * im
@@ -121,10 +161,6 @@ def infer_diagonal_roots(
 ) -> np.ndarray:
     """
     Find real roots of the diagonal balance L_ii(diag(r)) = 0.
-
-    A logarithmic grid of starting points (positive and negative, plus zero) is
-    used so that both small and large roots are recovered without model-specific
-    tuning.
 
     Returns
     -------
@@ -175,38 +211,14 @@ def _fallback_scale(model, params: dict) -> float:
         return 100.0
 
 
-def infer_guess_bounds(
+def _guess_bounds_from_roots(
     model,
     params: dict,
     fallback_scale: float = 100.0,
     margin: float = 2.0,
     r_max: float = 1e6,
 ) -> GuessBounds:
-    """
-    Infer model- and parameter-aware initial-guess bounds.
-
-    The bounds are built from the diagonal-balance roots.  They automatically
-    adapt to the order of magnitude and sign of the steady-state diagonal
-    entries.
-
-    Parameters
-    ----------
-    model : Model
-        R-matrix model.
-    params : dict
-        Parameter dictionary.
-    fallback_scale : float
-        Scale used when the diagonal balance yields no roots.
-    margin : float
-        Extra multiplicative margin applied on each side of the root range.
-    r_max : float
-        Largest magnitude scanned by ``infer_diagonal_roots``.
-
-    Returns
-    -------
-    GuessBounds
-        Sampling bounds and diagonal candidates for seed generation.
-    """
+    """Build bounds from diagonal-balance roots."""
     n = model.dim
     roots = infer_diagonal_roots(model, params, r_max=r_max)
 
@@ -216,17 +228,13 @@ def infer_guess_bounds(
         upper = np.full(n, scale)
         candidates = np.zeros((1, n))
     else:
-        # Always include zero so non-PSD / trivial branches are not excluded.
-        candidates = _unique_rows(
-            np.vstack([roots, np.zeros((1, n))]), tol=1e-3
-        )
+        candidates = _unique_rows(np.vstack([roots, np.zeros((1, n))]), tol=1e-3)
         lower_raw = np.min(candidates, axis=0)
         upper_raw = np.max(candidates, axis=0)
 
         lower = np.where(lower_raw < 0, lower_raw * margin, -fallback_scale * 0.1)
         upper = np.where(upper_raw > 0, upper_raw * margin, fallback_scale * 0.1)
 
-    # Per-pair off-diagonal scale: geometric mean of the two diagonal ranges.
     offdiag = np.zeros((n, n))
     for i in range(n):
         for j in range(i + 1, n):
@@ -239,6 +247,167 @@ def infer_guess_bounds(
         diag_upper=upper,
         offdiag_scale=offdiag,
         diag_candidates=candidates,
+    )
+
+
+def _make_log_uniform_guesses(
+    dim: int,
+    n_samples: int,
+    r_min: float = 1e-4,
+    r_max: float = 1e6,
+    seed: int | None = None,
+) -> list[np.ndarray]:
+    """Generate heavy-tailed Hermitian guesses with log-uniform diagonals."""
+    rng = np.random.default_rng(seed)
+    guesses: list[np.ndarray] = []
+    log_min, log_max = np.log10(r_min), np.log10(r_max)
+    for _ in range(n_samples):
+        R = np.zeros((dim, dim), dtype=complex)
+        diag_mags = []
+        for i in range(dim):
+            sign = rng.choice([-1.0, 1.0])
+            mag = 10.0 ** rng.uniform(log_min, log_max)
+            R[i, i] = sign * mag
+            diag_mags.append(abs(mag))
+        for i in range(dim):
+            for j in range(i + 1, dim):
+                s = 0.5 * np.sqrt(diag_mags[i] * diag_mags[j])
+                re = rng.normal(0.0, max(s, r_min))
+                im = rng.normal(0.0, max(s, r_min))
+                R[i, j] = re + 1j * im
+                R[j, i] = re - 1j * im
+        guesses.append(R)
+    return guesses
+
+
+def explore_solution_bounds(
+    model,
+    params: dict,
+    n_samples: int = 300,
+    r_min: float = 1e-4,
+    r_max: float = 1e6,
+    seed: int = 0,
+    residual_tol: float = 1e-4,
+    margin: float = 2.0,
+) -> GuessBounds | None:
+    """
+    Infer guess bounds by actually solving the model from heavy-tailed guesses.
+
+    This is more expensive than ``_guess_bounds_from_roots`` but captures
+    branches whose R elements are driven far from the diagonal-balance scale by
+    coupling or bifurcations.
+
+    Returns ``None`` if no solutions are found, so the caller can fall back.
+    """
+    n = model.dim
+    guesses = _make_log_uniform_guesses(n, n_samples, r_min, r_max, seed)
+    candidates: list = []
+
+    # Prefer the batched solver for speed; fall back to sequential solves if
+    # the model does not expose a symbolic Jacobian builder.
+    try:
+        from numerics.solvers.batched import solve_steady_state_batched
+
+        params_batch = {k: np.array([v]) for k, v in params.items()}
+        guesses_arr = np.asarray(guesses).reshape(1, n_samples, n, n)
+        results = solve_steady_state_batched(
+            model,
+            params_batch,
+            guesses_arr,
+            max_iter=50,
+            tol=1e-10,
+            line_search=True,
+            compute_eigvals=False,
+        )
+        candidates = [r for r in results[0] if r.success and r.residual <= residual_tol]
+    except Exception:
+        pass
+
+    if not candidates:
+        from numerics.solvers.steady_state import solve_steady_state
+
+        for g in guesses:
+            try:
+                res = solve_steady_state(
+                    model, params, guess=g, method="root", tol=1e-10, use_jacobian=False
+                )
+                if res.success and res.residual <= residual_tol:
+                    candidates.append(res)
+            except Exception:
+                continue
+
+    if not candidates:
+        return None
+
+    # Deduplicate converged solutions.
+    from numerics.core.r_matrix import R_matrix_to_vector
+
+    seen: list[np.ndarray] = []
+    unique: list = []
+    for r in candidates:
+        vec = R_matrix_to_vector(r.R)
+        if all(np.linalg.norm(vec - s) >= 1.0 for s in seen):
+            seen.append(vec)
+            unique.append(r)
+
+    diag_vals = np.array([np.real(np.diag(r.R)) for r in unique])
+    lower = np.min(diag_vals, axis=0)
+    upper = np.max(diag_vals, axis=0)
+    lower = np.minimum(lower, 0.0)
+    upper = np.maximum(upper, 0.0)
+
+    # Widen by ``margin`` away from zero; also keep a small negative/positive
+    # window on the opposite side so branches crossing zero are not lost.
+    max_abs = max(np.max(np.abs(lower)), np.max(np.abs(upper)), 1.0)
+    lower = np.where(lower < 0, lower * margin, -0.1 * max_abs)
+    upper = np.where(upper > 0, upper * margin, 0.1 * max_abs)
+
+    offdiag = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            vals = [abs(r.R[i, j]) for r in unique]
+            offdiag[i, j] = offdiag[j, i] = margin * max(vals + [1e-8])
+
+    return GuessBounds(
+        diag_lower=lower,
+        diag_upper=upper,
+        offdiag_scale=offdiag,
+        diag_candidates=diag_vals,
+    )
+
+
+def infer_guess_bounds(
+    model,
+    params: dict,
+    fallback_scale: float = 100.0,
+    margin: float = 2.0,
+    r_max: float = 1e6,
+    explore: bool = True,
+    explore_samples: int = 300,
+) -> GuessBounds:
+    """
+    Infer model- and parameter-aware initial-guess bounds.
+
+    By default this first tries a short exploratory solve with heavy-tailed
+    log-uniform guesses.  If that fails to find any solutions, it falls back to
+    the cheaper diagonal-balance root estimate.
+    """
+    if explore:
+        bounds = explore_solution_bounds(
+            model,
+            params,
+            n_samples=explore_samples,
+            r_min=1e-4,
+            r_max=r_max,
+            seed=0,
+            residual_tol=1e-4,
+            margin=margin,
+        )
+        if bounds is not None:
+            return bounds
+
+    return _guess_bounds_from_roots(
+        model, params, fallback_scale=fallback_scale, margin=margin, r_max=r_max
     )
 
 

@@ -41,15 +41,15 @@ def main():
 
     # Grid definition.  These can later be moved to a YAML/JSON config file or
     # argparse without touching the scanning logic.
-    N_OA = 801
-    N_GB = 961
+    N_OA = 1801
+    N_GB = 1801
 
     scan = MultistabilityScan2D(
         model=model,
         base_params=base_params,
         axes={
-            "gamma_b": np.linspace(0.3, 1.5, N_GB),
-            "omega_a": np.linspace(-0.5, 0.5, N_OA),
+            "gamma_b": np.linspace(0.3, 1.2, N_GB),
+            "omega_a": np.linspace(-0.3, 0.3, N_OA),
         },
         n_random_guesses=100,
         tolerances=ScanTolerances(
@@ -60,7 +60,7 @@ def main():
         ),
         max_branches=5,
         backend="numpy",
-        parallel=ParallelConfig(n_workers=40, n_tiles=256),
+        parallel=ParallelConfig(n_workers=32, n_tiles=288),
         guess_bounds="auto",
         verbose=True,
     )

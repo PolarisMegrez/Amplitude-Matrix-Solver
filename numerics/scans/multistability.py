@@ -205,6 +205,7 @@ class MultistabilityScan2D:
         self.backend = self._resolve_backend(backend)
         self.parallel = parallel
         self.symmetry_axis = symmetry_axis
+        self._guess_bounds_input = guess_bounds
         self.guess_bounds = self._resolve_guess_bounds(guess_bounds)
         self.verbose = verbose
 
@@ -216,13 +217,16 @@ class MultistabilityScan2D:
         self,
         guess_bounds: GuessBounds | Literal["auto"] | None,
     ) -> GuessBounds | None:
-        """Resolve the user-supplied guess-bound policy."""
-        if guess_bounds is None:
+        """Resolve the user-supplied guess-bound policy.
+
+        ``"auto"`` is intentionally resolved later, over the seed parameter
+        points, so the bounds reflect the whole scan window rather than only the
+        nominal center.
+        """
+        if guess_bounds is None or guess_bounds == "auto":
             return None
         if isinstance(guess_bounds, GuessBounds):
             return guess_bounds
-        if guess_bounds == "auto":
-            return infer_guess_bounds(self.model, self.base_params)
         raise ValueError(f"Unknown guess_bounds policy: {guess_bounds!r}")
 
     def _resolve_backend(self, backend: str) -> str:
@@ -301,6 +305,25 @@ class MultistabilityScan2D:
         ]
         if self.verbose:
             print("=== Discovering seed fixed points ===")
+
+        # If the user asked for automatic bounds, infer them from the seed
+        # parameter points and merge, so the bounds cover the whole scan window
+        # instead of just the nominal center.
+        if self._guess_bounds_input == "auto" and self.guess_bounds is None:
+            if self.verbose:
+                print("  (inferring adaptive guess bounds from seed points)")
+            bounds_list = [
+                infer_guess_bounds(self.model, p, explore_samples=200)
+                for p in seed_points
+            ]
+            self.guess_bounds = merge_guess_bounds(bounds_list)
+            if self.verbose:
+                print(
+                    f"  inferred diag bounds: "
+                    f"lower={self.guess_bounds.diag_lower.tolist()}, "
+                    f"upper={self.guess_bounds.diag_upper.tolist()}"
+                )
+
         seed_Rs = discover_seed_guesses_multi_point(
             self.model, seed_points, bounds=self.guess_bounds
         )
@@ -854,6 +877,19 @@ class MultistabilityScan2D:
     ) -> None:
         """Recompute and store all derived quantities for a single grid point."""
         n = self.model.dim
+        if not fps:
+            result.n_solutions[i, j] = 0
+            for k in range(self.max_branches):
+                result.R_matrices[i, j, k] = np.nan + 0j * np.nan
+                result.residuals[i, j, k] = np.nan
+                result.omegas[i, j, k] = np.nan
+                result.J_eigvals[i, j, k] = np.nan + 0j * np.nan
+                result.is_psd[i, j, k] = False
+                result.is_stable[i, j, k] = False
+                result.branch_ids[i, j, k] = -1
+            grid[i][j] = []
+            return
+
         result.n_solutions[i, j] = len(fps)
         bidx = match_to_neighbors(fps, neighbor_fps, self.tolerances.branch_match_tol)
 
