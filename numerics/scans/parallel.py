@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from typing import Callable, Sequence
 
 import numpy as np
@@ -92,38 +94,93 @@ class TileScanRunner:
         """
         Dispatch tiles to workers and merge each result as it completes.
 
-        Parameters
-        ----------
-        tiles : sequence of tile tuples
-        tile_args : sequence
-            One argument object per tile, passed to ``worker_func``.
-        merge_func : callable
-            ``merge_func(tile, result)`` is called in the parent process for
-            each completed tile.
+        A background status thread prints the elapsed time, completed/pending
+        tile counts and an ETA every few seconds.  This makes it obvious whether
+        the bottleneck is worker startup (long wait before the first tile) or
+        individual tile computation.
         """
         n_total = len(tiles)
         if n_total == 0:
             return
 
+        t0 = time.perf_counter()
         if self.verbose:
-            print(f"  Dispatching {n_total} tiles to {self.n_workers} workers...")
+            print(
+                f"  Dispatching {n_total} tiles to {self.n_workers} workers "
+                f"(elapsed timer started)...",
+                flush=True,
+            )
 
-        with ProcessPoolExecutor(
-            max_workers=self.n_workers,
-            initializer=self.initializer,
-            initargs=self.initargs,
-        ) as executor:
-            futures = {
-                executor.submit(self.worker_func, args): tile
-                for tile, args in zip(tiles, tile_args)
-            }
-            completed = 0
-            for fut in as_completed(futures):
-                tile = futures[fut]
-                result = fut.result()
-                completed += 1
-                if self.verbose and (
-                    completed % max(1, n_total // 10) == 0 or completed == n_total
-                ):
-                    print(f"  Parallel scan: {completed}/{n_total} tiles completed", flush=True)
-                merge_func(tile, result)
+        # Shared state for the status thread.
+        completed_lock = threading.Lock()
+        completed = 0
+        done_event = threading.Event()
+
+        def _status_loop(interval: float = 5.0) -> None:
+            """Print elapsed time and completion counts until all tiles finish."""
+            while not done_event.wait(interval):
+                with completed_lock:
+                    c = completed
+                elapsed = time.perf_counter() - t0
+                pending = n_total - c
+                pct = 100.0 * c / n_total
+                if c > 0:
+                    eta = elapsed / c * pending
+                    print(
+                        f"  Parallel scan: {c}/{n_total} tiles done "
+                        f"({pct:.1f}%) | elapsed {elapsed:.1f}s "
+                        f"| pending {pending} | ETA {eta:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  Parallel scan: 0/{n_total} tiles done "
+                        f"| elapsed {elapsed:.1f}s "
+                        f"| waiting for first tile to finish...",
+                        flush=True,
+                    )
+
+        status_thread = threading.Thread(target=_status_loop, daemon=True)
+        status_thread.start()
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=self.n_workers,
+                initializer=self.initializer,
+                initargs=self.initargs,
+            ) as executor:
+                futures = {
+                    executor.submit(self.worker_func, args): tile
+                    for tile, args in zip(tiles, tile_args)
+                }
+                for fut in as_completed(futures):
+                    tile = futures[fut]
+                    result = fut.result()
+                    with completed_lock:
+                        completed += 1
+                        c = completed
+                    if self.verbose and (
+                        c % max(1, n_total // 10) == 0 or c == n_total
+                    ):
+                        elapsed = time.perf_counter() - t0
+                        pending = n_total - c
+                        pct = 100.0 * c / n_total
+                        eta = elapsed / c * pending if c > 0 else 0.0
+                        print(
+                            f"  Parallel scan: {c}/{n_total} tiles completed "
+                            f"({pct:.1f}%) | elapsed {elapsed:.1f}s "
+                            f"| ETA {eta:.1f}s",
+                            flush=True,
+                        )
+                    merge_func(tile, result)
+        finally:
+            done_event.set()
+            status_thread.join(timeout=6.0)
+
+        if self.verbose:
+            elapsed = time.perf_counter() - t0
+            print(
+                f"  Parallel scan finished: {n_total}/{n_total} tiles "
+                f"in {elapsed:.1f}s",
+                flush=True,
+            )

@@ -9,6 +9,7 @@ returns a structured result container.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
@@ -303,6 +304,7 @@ class MultistabilityScan2D:
             {**self.base_params, names[0]: ax0[-1], names[1]: ax1[-1]},
             self.base_params,
         ]
+        t0 = time.perf_counter()
         if self.verbose:
             print("=== Discovering seed fixed points ===")
 
@@ -328,7 +330,8 @@ class MultistabilityScan2D:
             self.model, seed_points, bounds=self.guess_bounds
         )
         if self.verbose:
-            print(f"Found {len(seed_Rs)} unique seed fixed points\n")
+            elapsed = time.perf_counter() - t0
+            print(f"Found {len(seed_Rs)} unique seed fixed points in {elapsed:.1f}s\n")
         return seed_Rs
 
     # -------------------------------------------------------------------------
@@ -436,7 +439,11 @@ class MultistabilityScan2D:
             (row_start, row_end, col_start, col_end, local_i, local_j)
             for row_start, row_end, col_start, col_end, local_i, local_j in tiles
         ]
+        t0 = time.perf_counter()
         runner.run(tiles, tile_args, merge)
+        if self.verbose:
+            elapsed = time.perf_counter() - t0
+            print(f"  Parallel tile scan phase took {elapsed:.1f}s\n")
         return n_solutions, R_matrices, residuals, branch_ids
 
     # -------------------------------------------------------------------------
